@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from datetime import UTC, datetime, timedelta
 
 from fastapi.testclient import TestClient
 
@@ -76,6 +77,60 @@ def command_compute_demo() -> int:
     return 0 if task.status_code == 202 and claimed.status_code == 200 and claimed.json().get("task") else 1
 
 
+def command_downlink_demo() -> int:
+    now = datetime.now(UTC)
+
+    def window(code: str, start_minutes: int, end_minutes: int, mbps: int) -> dict:
+        return {
+            "code": code,
+            "starts_at": (now + timedelta(minutes=start_minutes)).isoformat(),
+            "ends_at": (now + timedelta(minutes=end_minutes)).isoformat(),
+            "total_mbps": mbps,
+        }
+
+    with TestClient(app) as client:
+        for payload in (window("demo-current", -30, 30, 100), window("demo-next", 40, 100, 100), window("demo-past", -120, -60, 50)):
+            created = client.post("/api/downlink/slices?actor=cli-demo", json=payload)
+            if created.status_code not in {201, 409}:
+                print(created.text)
+                return 1
+        for tenant, price in (("sat-alpha", 1.5), ("sat-beta", 1.0)):
+            quota = client.put(f"/api/downlink/tenants/{tenant}/quota?actor=cli-demo", json={"quota_mb": 5000, "price_per_mb": price})
+            if quota.status_code != 200:
+                print(quota.text)
+                return 1
+        normal = client.post(
+            "/api/downlink/reservations",
+            json={"tenant": "sat-beta", "message_key": "demo-normal-1", "size_mb": 200, "priority": 20, "required_mbps": 80},
+        )
+        emergency = client.post(
+            "/api/downlink/reservations",
+            json={"tenant": "sat-alpha", "message_key": "demo-emergency-1", "size_mb": 100, "priority": 95, "required_mbps": 50},
+        )
+        migration = client.post("/api/downlink/migrations", json={"actor": "cli-demo"})
+        slices = {item["code"]: item for item in client.get("/api/downlink/slices").json()["items"]}
+        settled = client.post("/api/downlink/settlements", json={"slice_id": slices["demo-past"]["id"], "actor": "cli-demo"})
+        preemptions = client.get("/api/downlink/decisions", params={"decision": "preempt"})
+        summary = client.get("/api/downlink/summary")
+    result = {
+        "normal": normal.json().get("outcome"),
+        "emergency": emergency.json().get("outcome"),
+        "preempted": emergency.json().get("preempted"),
+        "migration": migration.json(),
+        "settle_status": settled.status_code,
+        "preempt_decisions": len(preemptions.json()["items"]),
+        "summary": summary.json(),
+    }
+    print(json.dumps(result, ensure_ascii=False))
+    ok = (
+        normal.status_code == 200
+        and emergency.status_code == 200
+        and emergency.json().get("outcome") in {"reserved", "replayed"}
+        and settled.status_code in {200, 409}
+    )
+    return 0 if ok else 1
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(prog="compute-operations", description="科学计算任务运营服务维护入口")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -83,8 +138,16 @@ def main() -> int:
     subparsers.add_parser("check-db", help="检查数据库完整性")
     subparsers.add_parser("smoke", help="执行本地 API 冒烟检查")
     subparsers.add_parser("compute-demo", help="执行计算任务提交与领取演示")
+    subparsers.add_parser("downlink-demo", help="执行卫星地面链路预留、抢占、迁移与结算演示")
     args = parser.parse_args()
-    return {"init-db": command_init, "check-db": command_check, "smoke": command_smoke, "compute-demo": command_compute_demo}[args.command]()
+    commands = {
+        "init-db": command_init,
+        "check-db": command_check,
+        "smoke": command_smoke,
+        "compute-demo": command_compute_demo,
+        "downlink-demo": command_downlink_demo,
+    }
+    return commands[args.command]()
 
 
 if __name__ == "__main__":
